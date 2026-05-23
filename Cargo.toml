@@ -1,0 +1,27 @@
+[workspace]
+members = [".", "axum-fault-tolerance-macros"]
+resolver = "2"
+
+[package]
+name = "axum-fault-tolerance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "MicroProfile-inspired fault tolerance primitives for async Rust."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["axum", "fault-tolerance", "microprofile", "retry", "circuit-breaker"]
+categories = ["asynchronous", "web-programming"]
+
+[dependencies]
+axum-fault-tolerance-macros = { version = "0.1.0", path = "axum-fault-tolerance-macros" }
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tower-layer = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }
+
+[features]
+default = ["tower"]
+tower = ["dep:tower-layer", "dep:tower-service"]
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }

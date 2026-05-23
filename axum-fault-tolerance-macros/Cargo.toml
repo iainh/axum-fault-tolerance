@@ -1,0 +1,24 @@
+[package]
+name = "axum-fault-tolerance-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Procedural macros for axum-fault-tolerance."
+license = "MIT OR Apache-2.0"
+readme = "../README.md"
+keywords = ["axum", "fault-tolerance", "microprofile", "proc-macro"]
+categories = ["development-tools::procedural-macro-helpers", "asynchronous"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", default-features = false, features = [
+    "clone-impls",
+    "full",
+    "parsing",
+    "printing",
+    "proc-macro",
+] }

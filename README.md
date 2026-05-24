@@ -54,6 +54,53 @@ concepts:
 
 Run one with `cargo run --example policy_stack`.
 
+## Optional integration features
+
+Enable `mp-config` to load policy sets from typed configuration:
+
+```toml
+axum-fault-tolerance = { features = ["mp-config"] }
+```
+
+```rust
+use axum_fault_tolerance::FaultToleranceConfig;
+use mp_config::{Config, ConfigProperties};
+
+# fn example(config: &Config) -> mp_config::Result<()> {
+let fault_tolerance =
+    FaultToleranceConfig::from_config_prefix(config, "inventory.fault-tolerance")?;
+let circuit_breaker = fault_tolerance.build_circuit_breaker();
+let policy = match circuit_breaker.clone() {
+    Some(circuit_breaker) => fault_tolerance.build_policy_with_circuit_breaker(circuit_breaker),
+    None => fault_tolerance.build_policy(),
+};
+# let _ = policy;
+# Ok(())
+# }
+```
+
+Supported config keys use kebab-case names such as `timeout`, `max-retries`,
+`retry-delay`, `bulkhead-size`, `circuit-request-volume`,
+`circuit-failure-ratio`, and `circuit-delay`. Duration values are parsed by
+`mp-config`, for example `250ms`, `2s`, or `1m`.
+
+Enable `axum-health` to expose circuit breaker state as a readiness check:
+
+```toml
+axum-fault-tolerance = { features = ["axum-health"] }
+```
+
+```rust
+use axum_health::Health;
+
+# fn example(circuit_breaker: axum_fault_tolerance::CircuitBreaker) {
+let health = Health::builder()
+    .include(circuit_breaker.health_check("inventory-circuit"))
+    .build();
+# let _ = health;
+# }
+```
+
 ## Concept guides
 
 The `docs/facets/` directory has one guide for each fault-tolerance facet:

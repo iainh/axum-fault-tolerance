@@ -39,6 +39,8 @@
 extern crate self as axum_fault_tolerance;
 
 pub use axum_fault_tolerance_macros::fault_tolerant;
+#[cfg(feature = "mp-config")]
+pub use config::FaultToleranceConfig;
 
 use std::collections::VecDeque;
 use std::error::Error as StdError;
@@ -51,6 +53,149 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+#[cfg(feature = "mp-config")]
+pub mod config {
+    //! `mp-config` integration for building fault-tolerance policies.
+
+    use super::{
+        Bulkhead, CircuitBreaker, CircuitBreakerConfig, FaultTolerance, FaultToleranceBuilder,
+        RetryPolicy,
+    };
+    use mp_config::ConfigProperties;
+    use std::time::Duration;
+
+    /// Configuration for a [`FaultTolerance`] policy set.
+    ///
+    /// All fields are optional so applications can enable only the facets they
+    /// configure. Use [`mp_config::ConfigProperties::from_config_prefix`] to
+    /// load this from an application-specific prefix.
+    #[derive(Debug, Clone, Default, ConfigProperties)]
+    #[config(rename_all = "kebab-case")]
+    pub struct FaultToleranceConfig {
+        /// Enables timeout handling when present.
+        pub timeout: Option<Duration>,
+        /// Enables retry handling when this or another retry field is present.
+        pub max_retries: Option<usize>,
+        /// Base delay between retry attempts.
+        pub retry_delay: Option<Duration>,
+        /// Random retry delay variation.
+        pub retry_jitter: Option<Duration>,
+        /// Maximum elapsed time for all retry attempts.
+        pub retry_max_duration: Option<Duration>,
+        /// Enables bulkhead handling when present.
+        pub bulkhead_size: Option<usize>,
+        /// Circuit breaker request volume threshold.
+        pub circuit_request_volume: Option<usize>,
+        /// Circuit breaker failure ratio.
+        pub circuit_failure_ratio: Option<f64>,
+        /// Circuit breaker delay before a half-open probe.
+        pub circuit_delay: Option<Duration>,
+    }
+
+    impl FaultToleranceConfig {
+        /// Builds a policy set from this configuration.
+        ///
+        /// If any circuit breaker field is configured, this creates a new
+        /// circuit breaker for the returned policy. Use
+        /// [`Self::build_policy_with_circuit_breaker`] when the breaker also
+        /// needs to be shared with health checks or metrics.
+        pub fn build_policy(&self) -> FaultTolerance {
+            let builder = self.apply_non_circuit_facets(FaultTolerance::builder());
+            match self.build_circuit_breaker() {
+                Some(circuit_breaker) => builder.circuit_breaker(circuit_breaker).build(),
+                None => builder.build(),
+            }
+        }
+
+        /// Builds a policy set using a caller-owned circuit breaker.
+        ///
+        /// The supplied breaker is attached only when this configuration
+        /// includes at least one circuit breaker field.
+        pub fn build_policy_with_circuit_breaker(
+            &self,
+            circuit_breaker: CircuitBreaker,
+        ) -> FaultTolerance {
+            let builder = self.apply_non_circuit_facets(FaultTolerance::builder());
+            if self.has_circuit_breaker_config() {
+                builder.circuit_breaker(circuit_breaker).build()
+            } else {
+                builder.build()
+            }
+        }
+
+        /// Builds a circuit breaker from the configured circuit fields.
+        ///
+        /// Returns `None` when no circuit breaker fields are configured.
+        pub fn build_circuit_breaker(&self) -> Option<CircuitBreaker> {
+            self.build_circuit_breaker_config().map(CircuitBreaker::new)
+        }
+
+        /// Builds only the circuit breaker configuration.
+        pub fn build_circuit_breaker_config(&self) -> Option<CircuitBreakerConfig> {
+            if !self.has_circuit_breaker_config() {
+                return None;
+            }
+
+            let mut config = CircuitBreakerConfig::new();
+            if let Some(threshold) = self.circuit_request_volume {
+                config = config.request_volume_threshold(threshold);
+            }
+            if let Some(ratio) = self.circuit_failure_ratio {
+                config = config.failure_ratio(ratio);
+            }
+            if let Some(delay) = self.circuit_delay {
+                config = config.delay(delay);
+            }
+            Some(config)
+        }
+
+        fn apply_non_circuit_facets(
+            &self,
+            mut builder: FaultToleranceBuilder,
+        ) -> FaultToleranceBuilder {
+            if let Some(timeout) = self.timeout {
+                builder = builder.timeout(timeout);
+            }
+
+            if self.has_retry_config() {
+                let mut retry = RetryPolicy::new();
+                if let Some(max_retries) = self.max_retries {
+                    retry = retry.max_retries(max_retries);
+                }
+                if let Some(delay) = self.retry_delay {
+                    retry = retry.delay(delay);
+                }
+                if let Some(jitter) = self.retry_jitter {
+                    retry = retry.jitter(jitter);
+                }
+                if let Some(max_duration) = self.retry_max_duration {
+                    retry = retry.max_duration(max_duration);
+                }
+                builder = builder.retry(retry);
+            }
+
+            if let Some(size) = self.bulkhead_size {
+                builder = builder.bulkhead(Bulkhead::new(size));
+            }
+
+            builder
+        }
+
+        fn has_retry_config(&self) -> bool {
+            self.max_retries.is_some()
+                || self.retry_delay.is_some()
+                || self.retry_jitter.is_some()
+                || self.retry_max_duration.is_some()
+        }
+
+        fn has_circuit_breaker_config(&self) -> bool {
+            self.circuit_request_volume.is_some()
+                || self.circuit_failure_ratio.is_some()
+                || self.circuit_delay.is_some()
+        }
+    }
+}
 
 /// Boxed operation error for applications that do not need a custom error enum.
 pub type BoxError = Box<dyn StdError + Send + Sync>;
@@ -472,6 +617,19 @@ impl CircuitBreaker {
         }
     }
 
+    /// Returns an `axum-health` provider that reports this circuit's readiness.
+    ///
+    /// The provider registers a readiness check with the supplied name. Open
+    /// circuits report `DOWN`; closed and half-open circuits report `UP` with
+    /// the current state attached as diagnostic data.
+    #[cfg(feature = "axum-health")]
+    pub fn health_check(&self, name: impl Into<String>) -> CircuitBreakerHealth {
+        CircuitBreakerHealth {
+            name: name.into(),
+            circuit_breaker: self.clone(),
+        }
+    }
+
     fn before_call(&self) -> std::result::Result<CircuitPermit, Error<()>> {
         let mut state = self
             .state
@@ -594,6 +752,39 @@ pub enum CircuitBreakerState {
     Open,
     /// One probe call is allowed to decide whether the circuit should close.
     HalfOpen,
+}
+
+/// `axum-health` readiness provider for a [`CircuitBreaker`].
+#[cfg(feature = "axum-health")]
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerHealth {
+    name: String,
+    circuit_breaker: CircuitBreaker,
+}
+
+#[cfg(feature = "axum-health")]
+impl axum_health::HealthCheck for CircuitBreakerHealth {
+    fn register(self, builder: axum_health::HealthBuilder) -> axum_health::HealthBuilder
+    where
+        Self: Sized,
+    {
+        let name = self.name;
+        let circuit_breaker = self.circuit_breaker;
+        builder.readiness(name, move || {
+            let circuit_breaker = circuit_breaker.clone();
+            async move {
+                let state = circuit_breaker.state();
+                let check = match state {
+                    CircuitBreakerState::Open => axum_health::Check::down(),
+                    CircuitBreakerState::Closed | CircuitBreakerState::HalfOpen => {
+                        axum_health::Check::up()
+                    }
+                };
+
+                Ok(check.with_data("state", format!("{state:?}")))
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1041,6 +1232,115 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(feature = "mp-config")]
+    #[tokio::test]
+    async fn config_builds_fault_tolerance_policy() {
+        use mp_config::{Config, ConfigProperties, MapSource};
+
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("defaults", 100)
+                    .with("inventory.timeout", "20ms")
+                    .with("inventory.max-retries", "1")
+                    .with("inventory.retry-delay", "1ms")
+                    .with("inventory.bulkhead-size", "2")
+                    .with("inventory.circuit-request-volume", "2")
+                    .with("inventory.circuit-failure-ratio", "0.5")
+                    .with("inventory.circuit-delay", "10ms"),
+            )
+            .build();
+        let policy = FaultToleranceConfig::from_config_prefix(&config, "inventory")
+            .unwrap()
+            .build_policy();
+        let attempts = AtomicUsize::new(0);
+
+        let result = policy
+            .call(|| async {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err("try again")
+                } else {
+                    Ok("ok")
+                }
+            })
+            .await;
+
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "mp-config")]
+    #[test]
+    fn config_builds_shared_circuit_breaker() {
+        use mp_config::{Config, ConfigProperties, MapSource};
+
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("defaults", 100)
+                    .with("inventory.circuit-request-volume", "2")
+                    .with("inventory.circuit-failure-ratio", "0.5")
+                    .with("inventory.circuit-delay", "10ms"),
+            )
+            .build();
+        let fault_tolerance =
+            FaultToleranceConfig::from_config_prefix(&config, "inventory").unwrap();
+
+        let circuit_breaker = fault_tolerance.build_circuit_breaker();
+
+        assert!(circuit_breaker.is_some());
+    }
+
+    #[cfg(feature = "axum-health")]
+    #[tokio::test]
+    async fn circuit_breaker_health_reports_open_circuit_down() {
+        use ::tower::util::ServiceExt;
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use serde_json::json;
+
+        let circuit = CircuitBreaker::new(
+            CircuitBreakerConfig::new()
+                .request_volume_threshold(1)
+                .failure_ratio(1.0)
+                .delay(Duration::from_secs(60)),
+        );
+        let policy = FaultTolerance::builder()
+            .circuit_breaker(circuit.clone())
+            .build();
+        let _ = policy.call(|| async { Err::<(), _>("down") }).await;
+
+        let response = axum_health::Health::builder()
+            .include(circuit.health_check("inventory-circuit"))
+            .build()
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "status": "DOWN",
+                "checks": [{
+                    "name": "inventory-circuit",
+                    "status": "DOWN",
+                    "data": {
+                        "state": "Open"
+                    }
+                }]
+            })
+        );
+    }
 
     #[tokio::test]
     async fn retries_until_operation_succeeds() {

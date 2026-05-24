@@ -15,16 +15,23 @@ categories = ["asynchronous", "web-programming"]
 
 [dependencies]
 axum-fault-tolerance-macros = { version = "0.1.0", path = "axum-fault-tolerance-macros" }
+axum-health = { version = "0.1.0", path = "../axum-health", optional = true }
+mp-config = { version = "0.1.0", path = "../mp-config", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 tower-layer = { version = "0.3", default-features = false, optional = true }
 tower-service = { version = "0.3", default-features = false, optional = true }
 
 [features]
 default = ["tower"]
+axum-health = ["dep:axum-health"]
+mp-config = ["dep:mp-config"]
 tower = ["dep:tower-layer", "dep:tower-service"]
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false }
+serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [[example]]
 name = "tower_service"

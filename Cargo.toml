@@ -16,8 +16,8 @@ categories = ["asynchronous", "web-programming"]
 [dependencies]
 axum-fault-tolerance-macros = { version = "0.1.0", path = "axum-fault-tolerance-macros" }
 tokio = { version = "1", default-features = false, features = ["sync", "time"] }
-tower-layer = { version = "0.3", optional = true }
-tower-service = { version = "0.3", optional = true }
+tower-layer = { version = "0.3", default-features = false, optional = true }
+tower-service = { version = "0.3", default-features = false, optional = true }
 
 [features]
 default = ["tower"]
@@ -25,3 +25,7 @@ tower = ["dep:tower-layer", "dep:tower-service"]
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+[[example]]
+name = "tower_service"
+required-features = ["tower"]

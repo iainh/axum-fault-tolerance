@@ -15,8 +15,8 @@ categories = ["asynchronous", "web-programming"]
 
 [dependencies]
 axum-fault-tolerance-macros = { version = "0.1.0", path = "axum-fault-tolerance-macros" }
-axum-health = { version = "0.1.0", path = "../axum-health", optional = true }
-mp-config = { version = "0.1.0", path = "../mp-config", optional = true }
+axum-health = { git = "ssh://git@github.com/iainh/axum-health.git", optional = true }
+mp-config = { git = "ssh://git@github.com/iainh/mp-config.git", tag = "v0.1.1", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 tower-layer = { version = "0.3", default-features = false, optional = true }
 tower-service = { version = "0.3", default-features = false, optional = true }

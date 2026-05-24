@@ -74,6 +74,7 @@ dependencies = [
 [[package]]
 name = "axum-health"
 version = "0.1.0"
+source = "git+ssh://git@github.com/iainh/axum-health.git#c59bb2d8e73c54ecabdb3af3855448defc5815e7"
 dependencies = [
  "axum",
  "axum-health-macros",
@@ -84,6 +85,7 @@ dependencies = [
 [[package]]
 name = "axum-health-macros"
 version = "0.1.0"
+source = "git+ssh://git@github.com/iainh/axum-health.git#c59bb2d8e73c54ecabdb3af3855448defc5815e7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -202,6 +204,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "mp-config"
 version = "0.1.0"
+source = "git+ssh://git@github.com/iainh/mp-config.git?tag=v0.1.1#1debb5cbbecf56f59e5ae32a0144fdf8af5f1e4d"
 dependencies = [
  "mp-config-macros",
  "toml",
@@ -210,6 +213,7 @@ dependencies = [
 [[package]]
 name = "mp-config-macros"
 version = "0.1.0"
+source = "git+ssh://git@github.com/iainh/mp-config.git?tag=v0.1.1#1debb5cbbecf56f59e5ae32a0144fdf8af5f1e4d"
 dependencies = [
  "proc-macro2",
  "quote",

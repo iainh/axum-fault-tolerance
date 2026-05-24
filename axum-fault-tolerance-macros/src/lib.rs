@@ -315,6 +315,7 @@ impl PolicyAttrs {
 struct RetryAttr {
     max_retries: Option<u64>,
     delay_ms: Option<u64>,
+    jitter_ms: Option<u64>,
     max_duration_ms: Option<u64>,
 }
 
@@ -328,6 +329,10 @@ impl RetryAttr {
 
         if let Some(delay_ms) = self.delay_ms {
             tokens = quote!(#tokens.delay(::std::time::Duration::from_millis(#delay_ms)));
+        }
+
+        if let Some(jitter_ms) = self.jitter_ms {
+            tokens = quote!(#tokens.jitter(::std::time::Duration::from_millis(#jitter_ms)));
         }
 
         if let Some(max_duration_ms) = self.max_duration_ms {
@@ -412,6 +417,7 @@ fn parse_retry_attr(attr: &Attribute) -> syn::Result<RetryAttr> {
     let mut retry = RetryAttr {
         max_retries: None,
         delay_ms: None,
+        jitter_ms: None,
         max_duration_ms: None,
     };
 
@@ -420,10 +426,14 @@ fn parse_retry_attr(attr: &Attribute) -> syn::Result<RetryAttr> {
             retry.max_retries = Some(parse_u64(&meta.value()?.parse()?)?);
         } else if meta.path.is_ident("delay_ms") {
             retry.delay_ms = Some(parse_u64(&meta.value()?.parse()?)?);
+        } else if meta.path.is_ident("jitter_ms") {
+            retry.jitter_ms = Some(parse_u64(&meta.value()?.parse()?)?);
         } else if meta.path.is_ident("max_duration_ms") {
             retry.max_duration_ms = Some(parse_u64(&meta.value()?.parse()?)?);
         } else {
-            return Err(meta.error("expected `max_retries`, `delay_ms`, or `max_duration_ms`"));
+            return Err(
+                meta.error("expected `max_retries`, `delay_ms`, `jitter_ms`, or `max_duration_ms`")
+            );
         }
         Ok(())
     })?;

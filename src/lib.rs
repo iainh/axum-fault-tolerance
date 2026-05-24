@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "tower")]
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Boxed error type for applications that do not need a custom error enum.
@@ -57,6 +57,17 @@ pub enum Error<E> {
     CircuitOpen,
     /// The bulkhead rejected the call because all permits were in use.
     BulkheadRejected,
+}
+
+impl<E> Error<E> {
+    fn as_ref(&self) -> Error<&E> {
+        match self {
+            Self::Operation(error) => Error::Operation(error),
+            Self::Timeout => Error::Timeout,
+            Self::CircuitOpen => Error::CircuitOpen,
+            Self::BulkheadRejected => Error::BulkheadRejected,
+        }
+    }
 }
 
 impl<E> Error<E> {
@@ -95,11 +106,236 @@ where
     }
 }
 
+type FailurePredicate<E> = Arc<dyn Fn(Error<&E>) -> bool + Send + Sync>;
+
+/// Classification rules for retry, fallback, and circuit breaker failures.
+///
+/// MicroProfile classifies Java exceptions with attributes such as `retryOn`,
+/// `abortOn`, `applyOn`, `skipOn`, and `failOn`. Rust applications usually know
+/// richer error values, so this type uses predicates over [`Error`].
+pub struct FailureClassifier<E> {
+    retry_on: Option<FailurePredicate<E>>,
+    abort_on: Option<FailurePredicate<E>>,
+    fallback_on: Option<FailurePredicate<E>>,
+    skip_fallback_on: Option<FailurePredicate<E>>,
+    circuit_failure_on: Option<FailurePredicate<E>>,
+    circuit_skip_on: Option<FailurePredicate<E>>,
+}
+
+impl<E> Clone for FailureClassifier<E> {
+    fn clone(&self) -> Self {
+        Self {
+            retry_on: self.retry_on.clone(),
+            abort_on: self.abort_on.clone(),
+            fallback_on: self.fallback_on.clone(),
+            skip_fallback_on: self.skip_fallback_on.clone(),
+            circuit_failure_on: self.circuit_failure_on.clone(),
+            circuit_skip_on: self.circuit_skip_on.clone(),
+        }
+    }
+}
+
+impl<E> Default for FailureClassifier<E> {
+    fn default() -> Self {
+        Self {
+            retry_on: None,
+            abort_on: None,
+            fallback_on: None,
+            skip_fallback_on: None,
+            circuit_failure_on: None,
+            circuit_skip_on: None,
+        }
+    }
+}
+
+impl<E> std::fmt::Debug for FailureClassifier<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailureClassifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E> FailureClassifier<E> {
+    /// Creates a classifier with permissive defaults.
+    ///
+    /// By default, all failures are retryable, trigger fallback, and count as
+    /// circuit breaker failures. Add predicates to narrow that behaviour.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retries only when `predicate` returns true.
+    pub fn retry_on_error(
+        mut self,
+        predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.retry_on = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Prevents retries when `predicate` returns true.
+    pub fn abort_on_error(
+        mut self,
+        predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.abort_on = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Applies fallback only when `predicate` returns true.
+    pub fn fallback_on_error(
+        mut self,
+        predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.fallback_on = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Skips fallback when `predicate` returns true.
+    pub fn skip_fallback_on_error(
+        mut self,
+        predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.skip_fallback_on = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Counts only failures where `predicate` returns true against the circuit.
+    pub fn circuit_failure_on_error(
+        mut self,
+        predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.circuit_failure_on = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Prevents failures where `predicate` returns true from counting against
+    /// the circuit.
+    pub fn circuit_skip_on_error(
+        mut self,
+        predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.circuit_skip_on = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Retries only operation errors where `predicate` returns true.
+    pub fn retry_on_operation(
+        self,
+        predicate: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.retry_on_error(move |error| match error {
+            Error::Operation(error) => predicate(error),
+            Error::Timeout | Error::CircuitOpen | Error::BulkheadRejected => false,
+        })
+    }
+
+    /// Prevents retries for operation errors where `predicate` returns true.
+    pub fn abort_on_operation(
+        self,
+        predicate: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.abort_on_error(move |error| match error {
+            Error::Operation(error) => predicate(error),
+            Error::Timeout | Error::CircuitOpen | Error::BulkheadRejected => false,
+        })
+    }
+
+    /// Applies fallback only for operation errors where `predicate` returns true.
+    pub fn fallback_on_operation(
+        self,
+        predicate: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.fallback_on_error(move |error| match error {
+            Error::Operation(error) => predicate(error),
+            Error::Timeout | Error::CircuitOpen | Error::BulkheadRejected => false,
+        })
+    }
+
+    /// Skips fallback for operation errors where `predicate` returns true.
+    pub fn skip_fallback_on_operation(
+        self,
+        predicate: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.skip_fallback_on_error(move |error| match error {
+            Error::Operation(error) => predicate(error),
+            Error::Timeout | Error::CircuitOpen | Error::BulkheadRejected => false,
+        })
+    }
+
+    /// Counts only operation errors where `predicate` returns true against the circuit.
+    pub fn circuit_failure_on_operation(
+        self,
+        predicate: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.circuit_failure_on_error(move |error| match error {
+            Error::Operation(error) => predicate(error),
+            Error::Timeout | Error::CircuitOpen | Error::BulkheadRejected => false,
+        })
+    }
+
+    /// Prevents operation errors where `predicate` returns true from counting
+    /// against the circuit.
+    pub fn circuit_skip_on_operation(
+        self,
+        predicate: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.circuit_skip_on_error(move |error| match error {
+            Error::Operation(error) => predicate(error),
+            Error::Timeout | Error::CircuitOpen | Error::BulkheadRejected => false,
+        })
+    }
+
+    fn should_retry(&self, error: Error<&E>) -> bool {
+        if self
+            .abort_on
+            .as_ref()
+            .is_some_and(|predicate| predicate(error.clone()))
+        {
+            return false;
+        }
+
+        self.retry_on
+            .as_ref()
+            .is_none_or(|predicate| predicate(error))
+    }
+
+    fn should_fallback(&self, error: Error<&E>) -> bool {
+        if self
+            .skip_fallback_on
+            .as_ref()
+            .is_some_and(|predicate| predicate(error.clone()))
+        {
+            return false;
+        }
+
+        self.fallback_on
+            .as_ref()
+            .is_none_or(|predicate| predicate(error))
+    }
+
+    fn is_circuit_failure(&self, error: Error<&E>) -> bool {
+        if self
+            .circuit_skip_on
+            .as_ref()
+            .is_some_and(|predicate| predicate(error.clone()))
+        {
+            return false;
+        }
+
+        self.circuit_failure_on
+            .as_ref()
+            .is_none_or(|predicate| predicate(error))
+    }
+}
+
 /// Retry configuration for an async operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     max_retries: usize,
     delay: Duration,
+    jitter: Duration,
     max_duration: Option<Duration>,
 }
 
@@ -108,6 +344,7 @@ impl Default for RetryPolicy {
         Self {
             max_retries: 3,
             delay: Duration::ZERO,
+            jitter: Duration::ZERO,
             max_duration: None,
         }
     }
@@ -128,6 +365,15 @@ impl RetryPolicy {
     /// Sets the delay between attempts.
     pub fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// Sets the random variation applied to retry delays.
+    ///
+    /// Effective delays are chosen from `delay - jitter` through
+    /// `delay + jitter`, saturating at zero.
+    pub fn jitter(mut self, jitter: Duration) -> Self {
+        self.jitter = jitter;
         self
     }
 
@@ -401,16 +647,34 @@ impl FaultTolerance {
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, E>>,
     {
+        self.call_classified(FailureClassifier::new(), &mut operation)
+            .await
+    }
+
+    /// Runs an async operation with explicit failure classification.
+    pub async fn call_classified<F, Fut, T, E>(
+        &self,
+        classifier: FailureClassifier<E>,
+        mut operation: F,
+    ) -> Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, E>>,
+    {
         let Some(retry) = self.retry else {
-            return self.call_once(&mut operation).await;
+            return self.call_once(&classifier, &mut operation).await;
         };
 
         let started_at = Instant::now();
         let mut retries = 0;
 
         loop {
-            let result = self.call_once(&mut operation).await;
-            if result.is_ok() || retries >= retry.max_retries {
+            let result = self.call_once(&classifier, &mut operation).await;
+            let Err(error) = &result else {
+                return result;
+            };
+
+            if retries >= retry.max_retries || !classifier.should_retry(error.as_ref()) {
                 return result;
             }
 
@@ -422,8 +686,9 @@ impl FaultTolerance {
                 return result;
             }
 
-            if !retry.delay.is_zero() {
-                tokio::time::sleep(retry.delay).await;
+            let delay = retry.delay_for_attempt(retries);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -446,7 +711,33 @@ impl FaultTolerance {
         }
     }
 
-    async fn call_once<F, Fut, T, E>(&self, operation: &mut F) -> Result<T, E>
+    /// Runs an async operation with explicit failure classification and fallback.
+    pub async fn call_with_classified_fallback<F, Fut, Fb, FbFut, T, E>(
+        &self,
+        classifier: FailureClassifier<E>,
+        operation: F,
+        fallback: Fb,
+    ) -> std::result::Result<T, Error<E>>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, E>>,
+        Fb: FnOnce(Error<E>) -> FbFut,
+        FbFut: Future<Output = std::result::Result<T, E>>,
+    {
+        match self.call_classified(classifier.clone(), operation).await {
+            Ok(value) => Ok(value),
+            Err(error) if classifier.should_fallback(error.as_ref()) => {
+                fallback(error).await.map_err(Error::Operation)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn call_once<F, Fut, T, E>(
+        &self,
+        classifier: &FailureClassifier<E>,
+        operation: &mut F,
+    ) -> Result<T, E>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, E>>,
@@ -482,11 +773,60 @@ impl FaultTolerance {
         if let (Some(circuit_breaker), Some(circuit_permit)) =
             (&self.circuit_breaker, circuit_permit)
         {
-            circuit_breaker.after_call(result.is_ok(), circuit_permit);
+            let circuit_success = match &result {
+                Ok(_) => true,
+                Err(error) => !classifier.is_circuit_failure(error.as_ref()),
+            };
+            circuit_breaker.after_call(circuit_success, circuit_permit);
         }
 
         result
     }
+}
+
+impl RetryPolicy {
+    fn delay_for_attempt(self, attempt: usize) -> Duration {
+        jitter_delay(self.delay, self.jitter, attempt)
+    }
+}
+
+fn jitter_delay(delay: Duration, jitter: Duration, attempt: usize) -> Duration {
+    if jitter.is_zero() {
+        return delay;
+    }
+
+    let delay_nanos = duration_nanos(delay);
+    let jitter_nanos = duration_nanos(jitter);
+    let spread = jitter_nanos.saturating_mul(2).saturating_add(1);
+    let offset = pseudo_random_nanos(attempt) % spread;
+
+    if offset <= jitter_nanos {
+        nanos_duration(delay_nanos.saturating_sub(jitter_nanos - offset))
+    } else {
+        nanos_duration(delay_nanos.saturating_add(offset - jitter_nanos))
+    }
+}
+
+fn duration_nanos(duration: Duration) -> u128 {
+    duration.as_nanos()
+}
+
+fn nanos_duration(nanos: u128) -> Duration {
+    let capped = nanos.min(u64::MAX as u128);
+    Duration::from_nanos(capped as u64)
+}
+
+fn pseudo_random_nanos(attempt: usize) -> u128 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut value = now ^ ((attempt as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[cfg(feature = "tower")]
@@ -626,6 +966,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classifier_can_abort_retries_for_operation_errors() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum ClientError {
+            Permanent,
+        }
+
+        let attempts = AtomicUsize::new(0);
+        let policy = FaultTolerance::builder()
+            .retry(RetryPolicy::new().max_retries(3))
+            .build();
+        let classifier =
+            FailureClassifier::new().abort_on_operation(|error| *error == ClientError::Permanent);
+
+        let result = policy
+            .call_classified(classifier, || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(ClientError::Permanent)
+            })
+            .await;
+
+        assert_eq!(result, Err(Error::Operation(ClientError::Permanent)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn classifier_can_skip_fallback() {
+        let policy = FaultTolerance::default();
+        let classifier = FailureClassifier::<&'static str>::new().skip_fallback_on_error(
+            |error| matches!(error, Error::Operation(error) if *error == "do-not-fallback"),
+        );
+
+        let result = policy
+            .call_with_classified_fallback(
+                classifier,
+                || async { Err::<(), &'static str>("do-not-fallback") },
+                |_error| async { Ok(()) },
+            )
+            .await;
+
+        assert_eq!(result, Err(Error::Operation("do-not-fallback")));
+    }
+
+    #[tokio::test]
+    async fn classifier_can_skip_circuit_failures() {
+        let circuit = CircuitBreaker::new(
+            CircuitBreakerConfig::new()
+                .request_volume_threshold(1)
+                .failure_ratio(1.0)
+                .delay(Duration::from_secs(60)),
+        );
+        let policy = FaultTolerance::builder()
+            .circuit_breaker(circuit.clone())
+            .build();
+        let classifier = FailureClassifier::<&'static str>::new().circuit_skip_on_error(
+            |error| matches!(error, Error::Operation(error) if *error == "ignored"),
+        );
+
+        let result = policy
+            .call_classified(classifier, || async { Err::<(), &'static str>("ignored") })
+            .await;
+
+        assert_eq!(result, Err(Error::Operation("ignored")));
+        assert_eq!(circuit.state(), CircuitBreakerState::Closed);
+    }
+
+    #[tokio::test]
     async fn timeout_fails_slow_operation() {
         let policy = FaultTolerance::builder()
             .timeout(Duration::from_millis(5))
@@ -639,6 +1045,18 @@ mod tests {
             .await;
 
         assert_eq!(result, Err(Error::Timeout));
+    }
+
+    #[test]
+    fn retry_jitter_stays_within_configured_bounds() {
+        let delay = Duration::from_millis(50);
+        let jitter = Duration::from_millis(10);
+
+        for attempt in 1..100 {
+            let effective = jitter_delay(delay, jitter, attempt);
+            assert!(effective >= Duration::from_millis(40));
+            assert!(effective <= Duration::from_millis(60));
+        }
     }
 
     #[tokio::test]

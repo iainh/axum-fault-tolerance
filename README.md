@@ -22,7 +22,12 @@ use std::time::Duration;
 # async fn example() -> Result<(), axum_fault_tolerance::Error<&'static str>> {
 let policy = FaultTolerance::builder()
     .timeout(Duration::from_secs(1))
-    .retry(RetryPolicy::new().max_retries(2))
+    .retry(
+        RetryPolicy::new()
+            .max_retries(2)
+            .delay(Duration::from_millis(100))
+            .jitter(Duration::from_millis(25)),
+    )
     .build();
 
 let user = policy
@@ -34,6 +39,40 @@ let user = policy
 
 assert_eq!(user, "alice");
 # Ok(())
+# }
+```
+
+## Failure classification
+
+Use `FailureClassifier` when only some failures should retry, trigger fallback,
+or count against the circuit breaker. This is the Rust version of
+MicroProfile's `retryOn`, `abortOn`, `applyOn`, `skipOn`, and `failOn`
+exception-class attributes.
+
+```rust
+use axum_fault_tolerance::{FailureClassifier, FaultTolerance, RetryPolicy};
+
+#[derive(Debug, PartialEq, Eq)]
+enum UsersError {
+    Transient,
+    Validation,
+}
+
+# async fn example() {
+let policy = FaultTolerance::builder()
+    .retry(RetryPolicy::new().max_retries(3))
+    .build();
+
+let classifier = FailureClassifier::new()
+    .retry_on_operation(|error: &UsersError| *error == UsersError::Transient)
+    .abort_on_operation(|error| *error == UsersError::Validation);
+
+let result = policy
+    .call_classified(classifier, || async {
+        Err::<(), _>(UsersError::Transient)
+    })
+    .await;
+# let _ = result;
 # }
 ```
 
@@ -101,7 +140,7 @@ impl Users {
 
 Supported method attributes:
 
-- `#[retry(max_retries = 3, delay_ms = 100, max_duration_ms = 1000)]`
+- `#[retry(max_retries = 3, delay_ms = 100, jitter_ms = 25, max_duration_ms = 1000)]`
 - `#[timeout(ms = 500)]`
 - `#[fallback(method = "fallback_method")]`
 - `#[circuit_breaker(request_volume_threshold = 20, failure_ratio = 0.5, delay_ms = 5000)]`

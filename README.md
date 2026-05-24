@@ -42,6 +42,18 @@ assert_eq!(user, "alice");
 # }
 ```
 
+## Runnable examples
+
+The `examples/` directory contains direct, runnable examples for the main
+concepts:
+
+- `policy_stack.rs` combines retry, timeout, circuit breaker, and bulkhead.
+- `classification_and_fallback.rs` shows retry/fallback classification rules.
+- `method_attributes.rs` shows `#[fault_tolerant]` method attributes.
+- `tower_service.rs` shows wrapping an Axum-compatible Tower service.
+
+Run one with `cargo run --example policy_stack`.
+
 ## Failure classification
 
 Use `FailureClassifier` when only some failures should retry, trigger fallback,

@@ -54,6 +54,11 @@ concepts:
 
 Run one with `cargo run --example policy_stack`.
 
+## Concept guides
+
+The `docs/facets/` directory has one guide for each fault-tolerance facet:
+retry, timeout, fallback, circuit breaker, and bulkhead.
+
 ## Failure classification
 
 Use `FailureClassifier` when only some failures should retry, trigger fallback,

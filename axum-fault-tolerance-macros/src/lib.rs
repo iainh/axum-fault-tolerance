@@ -9,8 +9,46 @@ use syn::{
 /// Rewrites annotated methods in an inherent `impl` block to use
 /// `axum-fault-tolerance` runtime policies.
 ///
-/// Supported method attributes are `#[retry]`, `#[timeout]`, `#[fallback]`,
-/// `#[circuit_breaker]`, and `#[bulkhead]`.
+/// This macro is the MicroProfile-style surface for Axum and async Rust code:
+/// keep the policy beside the method, but execute it through explicit
+/// `FaultTolerance` policies rather than Java container interceptors.
+///
+/// Supported method attributes are:
+///
+/// - `#[retry(max_retries = 3, delay_ms = 100, jitter_ms = 25, max_duration_ms = 1000)]`
+/// - `#[timeout(ms = 500)]`
+/// - `#[fallback(method = "fallback_method")]`
+/// - `#[circuit_breaker(request_volume_threshold = 20, failure_ratio = 0.5, delay_ms = 5000)]`
+/// - `#[bulkhead(max_concurrent = 32)]`
+///
+/// Annotated methods must be async inherent methods that take `&self` and return
+/// `Result<T, E>`. Without `#[fallback]`, the generated public wrapper returns
+/// `axum_fault_tolerance::Result<T, E>` so policy failures are visible. With
+/// `#[fallback]`, the wrapper keeps the original `Result<T, E>` return type.
+///
+/// ```rust,ignore
+/// use axum_fault_tolerance::{Error, fault_tolerant};
+///
+/// struct Users;
+///
+/// #[fault_tolerant]
+/// impl Users {
+///     #[retry(max_retries = 2, delay_ms = 100)]
+///     #[timeout(ms = 500)]
+///     #[fallback(method = "cached_user")]
+///     async fn load_user(&self, id: u64) -> Result<String, &'static str> {
+///         Err("upstream unavailable")
+///     }
+///
+///     async fn cached_user(
+///         &self,
+///         id: u64,
+///         error: Error<&'static str>,
+///     ) -> Result<String, &'static str> {
+///         Ok(format!("cached user {id}: {error}"))
+///     }
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn fault_tolerant(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut impl_item = parse_macro_input!(item as ItemImpl);

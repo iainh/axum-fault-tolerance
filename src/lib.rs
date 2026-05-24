@@ -1,9 +1,15 @@
-//! MicroProfile-inspired fault tolerance primitives for async Rust.
+//! MicroProfile-style fault tolerance for Axum and async Rust.
 //!
-//! `axum-fault-tolerance` keeps the useful MicroProfile Fault Tolerance ideas:
-//! retry, timeout, fallback, circuit breaker, and bulkhead. It adapts them to
-//! Rust as explicit runtime policies around async operations instead of Java
-//! container interceptors.
+//! `axum-fault-tolerance` brings the useful parts of Eclipse MicroProfile Fault
+//! Tolerance to Rust request handlers, service clients and Tower services. The
+//! vocabulary stays familiar: retry, timeout, fallback, circuit breaker and
+//! bulkhead. The execution model is Rust-native: explicit policy values wrap
+//! async operations instead of Java container interceptors wrapping annotated
+//! CDI beans.
+//!
+//! Use [`FaultTolerance`] directly around fallible async work in handlers,
+//! extractors, repositories or clients. Enable the default `tower` feature to
+//! wrap Axum-compatible Tower services with [`tower::FaultToleranceLayer`].
 //!
 //! ```
 //! use axum_fault_tolerance::{FaultTolerance, RetryPolicy};
@@ -23,6 +29,12 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! The [`fault_tolerant`] macro is available when method-level attributes are a
+//! better fit. It keeps the MicroProfile annotation style while still expanding
+//! to the same runtime policies used by [`FaultTolerance`].
+//!
+//! See `docs/facets/` for focused guides covering each fault-tolerance facet.
 
 extern crate self as axum_fault_tolerance;
 
@@ -40,22 +52,29 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Boxed error type for applications that do not need a custom error enum.
+/// Boxed operation error for applications that do not need a custom error enum.
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
-/// Result returned by fault-tolerant operations.
+/// Result returned by fault-tolerant operations and method wrappers.
+///
+/// The outer [`Error`] identifies whether the failure came from the protected
+/// operation or from a policy such as timeout, circuit breaker or bulkhead.
 pub type Result<T, E = BoxError> = std::result::Result<T, Error<E>>;
 
-/// Error returned by a fault-tolerant operation.
+/// Error returned by a protected operation or by a policy decision.
+///
+/// MicroProfile models these cases as exceptions from interceptors. This crate
+/// keeps them explicit so Axum handlers and Tower services can decide whether
+/// to map them to HTTP responses, logs, metrics or fallbacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error<E> {
-    /// The wrapped operation returned an application error.
+    /// The wrapped operation returned an application or service error.
     Operation(E),
-    /// The operation did not finish before its timeout.
+    /// The operation did not finish before the configured timeout.
     Timeout,
-    /// The circuit breaker rejected the call while open.
+    /// The circuit breaker rejected the call while the circuit was open.
     CircuitOpen,
-    /// The bulkhead rejected the call because all permits were in use.
+    /// The bulkhead rejected the call because all concurrency permits were in use.
     BulkheadRejected,
 }
 
@@ -108,11 +127,15 @@ where
 
 type FailurePredicate<E> = Arc<dyn Fn(Error<&E>) -> bool + Send + Sync>;
 
-/// Classification rules for retry, fallback, and circuit breaker failures.
+/// Classification rules for retry, fallback and circuit breaker decisions.
 ///
 /// MicroProfile classifies Java exceptions with attributes such as `retryOn`,
 /// `abortOn`, `applyOn`, `skipOn`, and `failOn`. Rust applications usually know
 /// richer error values, so this type uses predicates over [`Error`].
+///
+/// Use a classifier when an Axum route should retry upstream transport errors,
+/// skip fallback for validation errors, or prevent expected domain errors from
+/// counting against a circuit breaker.
 pub struct FailureClassifier<E> {
     retry_on: Option<FailurePredicate<E>>,
     abort_on: Option<FailurePredicate<E>>,
@@ -166,6 +189,8 @@ impl<E> FailureClassifier<E> {
     }
 
     /// Retries only when `predicate` returns true.
+    ///
+    /// This is the Rust predicate form of MicroProfile's `retryOn`.
     pub fn retry_on_error(
         mut self,
         predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
@@ -175,6 +200,8 @@ impl<E> FailureClassifier<E> {
     }
 
     /// Prevents retries when `predicate` returns true.
+    ///
+    /// This is the Rust predicate form of MicroProfile's `abortOn`.
     pub fn abort_on_error(
         mut self,
         predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
@@ -184,6 +211,8 @@ impl<E> FailureClassifier<E> {
     }
 
     /// Applies fallback only when `predicate` returns true.
+    ///
+    /// This is the Rust predicate form of MicroProfile's `applyOn`.
     pub fn fallback_on_error(
         mut self,
         predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
@@ -193,6 +222,8 @@ impl<E> FailureClassifier<E> {
     }
 
     /// Skips fallback when `predicate` returns true.
+    ///
+    /// This is the Rust predicate form of MicroProfile's `skipOn`.
     pub fn skip_fallback_on_error(
         mut self,
         predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
@@ -202,6 +233,8 @@ impl<E> FailureClassifier<E> {
     }
 
     /// Counts only failures where `predicate` returns true against the circuit.
+    ///
+    /// This is the Rust predicate form of MicroProfile's `failOn`.
     pub fn circuit_failure_on_error(
         mut self,
         predicate: impl Fn(Error<&E>) -> bool + Send + Sync + 'static,
@@ -331,6 +364,10 @@ impl<E> FailureClassifier<E> {
 }
 
 /// Retry configuration for an async operation.
+///
+/// This is the runtime equivalent of MicroProfile's `@Retry`. In Axum code,
+/// place it on a [`FaultTolerance`] policy used around a handler dependency,
+/// service client call, queue operation or other fallible async work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     max_retries: usize,
@@ -357,12 +394,14 @@ impl RetryPolicy {
     }
 
     /// Sets the maximum number of retries after the initial attempt.
+    ///
+    /// `max_retries(2)` permits up to three total attempts.
     pub fn max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
         self
     }
 
-    /// Sets the delay between attempts.
+    /// Sets the base delay between attempts.
     pub fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
@@ -378,13 +417,22 @@ impl RetryPolicy {
     }
 
     /// Sets the maximum elapsed time for all attempts.
+    ///
+    /// This bounds the retry loop itself. Pair it with
+    /// [`FaultToleranceBuilder::timeout`] when each individual attempt also
+    /// needs a latency budget.
     pub fn max_duration(mut self, max_duration: Duration) -> Self {
         self.max_duration = Some(max_duration);
         self
     }
 }
 
-/// Shared circuit breaker state.
+/// Shared circuit breaker state for failing fast while a dependency recovers.
+///
+/// This is the runtime equivalent of MicroProfile's `@CircuitBreaker`. Clone
+/// one breaker into every policy that should share the same request-volume and
+/// failure-ratio window, such as all calls from an Axum application to one
+/// upstream service.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
@@ -409,6 +457,9 @@ impl CircuitBreaker {
     }
 
     /// Returns the current circuit breaker state.
+    ///
+    /// This is useful for health endpoints, metrics and tests. Normal request
+    /// flow does not need to inspect the state before calling a policy.
     pub fn state(&self) -> CircuitBreakerState {
         let state = self
             .state
@@ -483,6 +534,11 @@ impl CircuitBreaker {
 }
 
 /// Circuit breaker configuration.
+///
+/// The configuration mirrors the MicroProfile model: a recent request volume,
+/// a failure ratio and a delay before the half-open probe. Durations use
+/// [`Duration`] so Axum applications can configure them from normal Rust
+/// settings rather than annotation literals.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CircuitBreakerConfig {
     request_volume_threshold: usize,
@@ -554,6 +610,10 @@ enum CircuitPermit {
 }
 
 /// Semaphore-style bulkhead that limits concurrent operations.
+///
+/// This is the async Rust equivalent of MicroProfile's `@Bulkhead`. It protects
+/// the rest of an Axum application from one busy dependency by rejecting calls
+/// once the configured in-flight limit is reached.
 #[derive(Debug, Clone)]
 pub struct Bulkhead {
     semaphore: Arc<Semaphore>,
@@ -577,7 +637,10 @@ impl Bulkhead {
     }
 }
 
-/// Builder for [`FaultTolerance`].
+/// Builder for a [`FaultTolerance`] policy set.
+///
+/// The builder composes MicroProfile-style facets into the policy object that
+/// Axum handlers, Tower services or application clients can reuse.
 #[derive(Debug, Clone, Default)]
 pub struct FaultToleranceBuilder {
     retry: Option<RetryPolicy>,
@@ -587,13 +650,13 @@ pub struct FaultToleranceBuilder {
 }
 
 impl FaultToleranceBuilder {
-    /// Enables retry handling.
+    /// Enables retry handling for protected operations.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = Some(retry);
         self
     }
 
-    /// Enables timeout handling.
+    /// Enables timeout handling for each protected attempt.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -622,7 +685,16 @@ impl FaultToleranceBuilder {
     }
 }
 
-/// Composable fault tolerance policy set.
+/// Composable fault-tolerance policy set.
+///
+/// `FaultTolerance` is the main Axum-facing API. Build one policy for a
+/// dependency or operation class, clone it into handlers or service layers, and
+/// call async work through [`Self::call`] or [`Self::call_with_fallback`].
+///
+/// The policy applies MicroProfile-style facets in a Rust-friendly way:
+/// bulkhead and circuit breaker checks happen before an attempt, timeout wraps
+/// the attempt future, retry repeats the whole attempt, and fallback can turn a
+/// policy failure into a degraded value.
 #[derive(Debug, Clone, Default)]
 pub struct FaultTolerance {
     retry: Option<RetryPolicy>,
@@ -642,6 +714,9 @@ impl FaultTolerance {
     /// Retries wrap the complete attempt, so each retry enters the circuit
     /// breaker and bulkhead again. This matches the useful MicroProfile
     /// behaviour without relying on Java interceptor machinery.
+    ///
+    /// In Axum code, the closure usually calls a database, HTTP client, queue
+    /// producer or other fallible dependency.
     pub async fn call<F, Fut, T, E>(&self, mut operation: F) -> Result<T, E>
     where
         F: FnMut() -> Fut,
@@ -652,6 +727,9 @@ impl FaultTolerance {
     }
 
     /// Runs an async operation with explicit failure classification.
+    ///
+    /// Use this when `retryOn`, `abortOn`, `applyOn`, `skipOn` or `failOn`
+    /// semantics need to depend on the actual Rust error value.
     pub async fn call_classified<F, Fut, T, E>(
         &self,
         classifier: FailureClassifier<E>,
@@ -694,6 +772,10 @@ impl FaultTolerance {
     }
 
     /// Runs an async operation and invokes `fallback` if the policy set fails.
+    ///
+    /// This is the runtime equivalent of MicroProfile's `@Fallback`. The
+    /// fallback receives the policy error so it can distinguish an upstream
+    /// error from timeout, circuit-open and bulkhead rejection cases.
     pub async fn call_with_fallback<F, Fut, Fb, FbFut, T, E>(
         &self,
         operation: F,
@@ -712,6 +794,8 @@ impl FaultTolerance {
     }
 
     /// Runs an async operation with explicit failure classification and fallback.
+    ///
+    /// Use this when only some failures should trigger a degraded response.
     pub async fn call_with_classified_fallback<F, Fut, Fb, FbFut, T, E>(
         &self,
         classifier: FailureClassifier<E>,
@@ -831,12 +915,20 @@ fn pseudo_random_nanos(attempt: usize) -> u128 {
 
 #[cfg(feature = "tower")]
 /// Tower integration for applying fault tolerance to Axum-compatible services.
+///
+/// This module adapts the same MicroProfile-style facets used by
+/// [`FaultTolerance`] to Tower's `Layer` and `Service` traits. Use it when the
+/// fault-tolerance boundary is a whole service rather than a single client call
+/// inside a handler.
 pub mod tower {
     use super::*;
     use tower_layer::Layer;
     use tower_service::Service;
 
     /// Tower layer that wraps a service with a [`FaultTolerance`] policy set.
+    ///
+    /// In an Axum stack, this is the layer form of applying retry, timeout,
+    /// circuit breaker and bulkhead policies around a service.
     #[derive(Debug, Clone)]
     pub struct FaultToleranceLayer {
         policy: FaultTolerance,
@@ -861,6 +953,10 @@ pub mod tower {
     }
 
     /// Tower service wrapper produced by [`FaultToleranceLayer`].
+    ///
+    /// The wrapped service must be cloneable because retries need a fresh
+    /// service value for each attempt. Requests must also be cloneable so the
+    /// same request can be replayed when retry is enabled.
     #[derive(Debug, Clone)]
     pub struct FaultToleranceService<S> {
         inner: S,
@@ -928,6 +1024,9 @@ impl MapOperationError for Error<()> {
 }
 
 /// Runs an operation with only timeout handling.
+///
+/// This is the lightweight equivalent of using `@Timeout` or
+/// [`FaultToleranceBuilder::timeout`] when no other facet is needed.
 pub async fn timeout<Fut, T, E>(duration: Duration, future: Fut) -> Result<T, E>
 where
     Fut: Future<Output = std::result::Result<T, E>>,

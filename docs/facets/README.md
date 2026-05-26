@@ -5,6 +5,9 @@ This directory documents the fault-tolerance facets provided by
 applies it to async Rust operations, and shows focused builder and macro
 example code.
 
+For an end-to-end Axum walkthrough, start with the
+[building resilient Axum services guide](../guide.md).
+
 - [Retry](retry.md)
 - [Timeout](timeout.md)
 - [Fallback](fallback.md)

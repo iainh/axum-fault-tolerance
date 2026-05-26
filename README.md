@@ -106,6 +106,9 @@ let health = Health::builder()
 The `docs/facets/` directory has one guide for each fault-tolerance facet:
 retry, timeout, fallback, circuit breaker, and bulkhead.
 
+For a step-by-step Axum walkthrough, see
+[`docs/guide.md`](docs/guide.md).
+
 ## Failure classification
 
 Use `FailureClassifier` when only some failures should retry, trigger fallback,
